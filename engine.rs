@@ -389,7 +389,20 @@ pub fn find_loader_id(mc: &str, loader: &str) -> Option<String> {
         "Forge" => ids
             .into_iter()
             .rev()
-            .find(|i| i.to_lowercase().contains("forge") && i.starts_with(mc)),
+            .find(|i| {
+                let l = i.to_lowercase();
+                l.contains("forge") && !l.starts_with("neoforge") && i.starts_with(&format!("{mc}-"))
+            }),
+        "OptiFine" => ids
+            .into_iter()
+            .rev()
+            .find(|i| i.starts_with(&format!("{mc}-OptiFine_"))),
+        "NeoForge" => ids.into_iter().rev().find(|i| {
+            i.starts_with("neoforge-")
+                && read_json(&version_json_path(i))
+                    .map(|j| j["inheritsFrom"].as_str() == Some(mc))
+                    .unwrap_or(false)
+        }),
         _ => Some(mc.to_string()),
     }
 }
@@ -860,6 +873,190 @@ fn install_forge(mc: &str, java_cli: &Path, p: &Progress) -> Result<()> {
     Ok(())
 }
 
+
+/// Префикс версии NeoForge для версии Minecraft: 1.21.1 -> "21.1.", 26.1.2 -> "26.1.2."
+fn neoforge_prefix(mc: &str) -> Option<String> {
+    let parts: Vec<&str> = mc.split('.').collect();
+    match parts.as_slice() {
+        ["1", minor] => Some(format!("{minor}.0.")),
+        ["1", minor, patch] => Some(format!("{minor}.{patch}.")),
+        [major, rest @ ..] if major.parse::<u32>().map(|m| m >= 26).unwrap_or(false) => {
+            Some(format!("{}.", std::iter::once(*major).chain(rest.iter().copied()).collect::<Vec<_>>().join(".")))
+        }
+        _ => None,
+    }
+}
+
+fn install_neoforge(mc: &str, java_cli: &Path, p: &Progress) -> Result<()> {
+    p.say("Поиск NeoForge...");
+    if mc == "1.20.1" {
+        bail!("Для 1.20.1 NeoForge не поддерживается, используй Forge");
+    }
+    let prefix = neoforge_prefix(mc).ok_or_else(|| anyhow!("Для версии {} нет NeoForge", mc))?;
+    let list = get_json("https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge")?;
+    let all: Vec<String> = list["versions"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let matching: Vec<&String> = all.iter().filter(|v| v.starts_with(&prefix)).collect();
+    let fv = matching
+        .iter()
+        .rev()
+        .find(|v| !v.contains('-'))
+        .or_else(|| matching.last())
+        .ok_or_else(|| anyhow!("Для версии {} нет NeoForge", mc))?
+        .to_string();
+    let url = format!("https://maven.neoforged.net/releases/net/neoforged/neoforge/{fv}/neoforge-{fv}-installer.jar");
+    let tmp_dir = mc_dir().join("nova_tmp");
+    let inst = tmp_dir.join(format!("neoforge-{fv}-installer.jar"));
+    p.say("Загрузка установщика NeoForge...");
+    download_all(vec![Job { url, path: inst.clone(), sha1: None, size: None }], p)?;
+    p.check()?;
+    let profiles = mc_dir().join("launcher_profiles.json");
+    if !profiles.exists() {
+        fs::write(&profiles, r#"{"profiles":{},"settings":{},"version":3}"#)?;
+    }
+    p.say("Установка NeoForge (может занять пару минут)...");
+    p.set(0, 1);
+    let mut cmd = Command::new(java_cli);
+    cmd.arg("-jar").arg(&inst).arg("--installClient").arg(mc_dir()).current_dir(mc_dir()).stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(sys::NO_WINDOW);
+    }
+    let out = cmd.output().map_err(|e| anyhow!("Не удалось запустить установщик NeoForge: {}", e))?;
+    let _ = fs::remove_dir_all(&tmp_dir);
+    if !out.status.success() {
+        let mut text = String::from_utf8_lossy(&out.stderr).to_string();
+        if text.trim().is_empty() {
+            text = String::from_utf8_lossy(&out.stdout).to_string();
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let tail = lines[lines.len().saturating_sub(6)..].join("\n");
+        bail!("Установщик NeoForge завершился с ошибкой:\n{}", tail);
+    }
+    Ok(())
+}
+
+
+/// OptiFine: ставится как отдельный профиль (по схеме официального установщика):
+/// скачиваем jar, патчим ванильный клиент через optifine.Patcher, пишем JSON версии.
+fn install_optifine(mc: &str, java_cli: &Path, p: &Progress) -> Result<()> {
+    p.say("Поиск OptiFine...");
+    let list = get_json("https://bmclapi2.bangbang93.com/optifine/versionList")?;
+    // (не пре-релиз, ключ патча, тип, патч)
+    let mut cands: Vec<(bool, (char, u32), String, String)> = Vec::new();
+    if let Some(arr) = list.as_array() {
+        for e in arr {
+            if e["mcversion"].as_str() != Some(mc) {
+                continue;
+            }
+            let (ty, patch) = match (e["type"].as_str(), e["patch"].as_str()) {
+                (Some(t), Some(pa)) => (t.to_string(), pa.to_string()),
+                _ => continue,
+            };
+            let low = patch.to_lowercase();
+            let stable = !(low.contains("pre") || low.contains("beta") || low.contains("alpha"));
+            let letter = patch.chars().next().unwrap_or('A').to_ascii_uppercase();
+            let num: u32 = patch.chars().skip(1).take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0);
+            cands.push((stable, (letter, num), ty, patch));
+        }
+    }
+    cands.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let (_, _, ty, patch) = cands.pop().ok_or_else(|| anyhow!("Для версии {} нет OptiFine", mc))?;
+    let ver = format!("{mc}_{ty}_{patch}");
+    let id = format!("{mc}-OptiFine_{ty}_{patch}");
+
+    let tmp_dir = mc_dir().join("nova_tmp");
+    let inst = tmp_dir.join(format!("OptiFine_{ver}.jar"));
+    p.say("Загрузка OptiFine...");
+    download_all(
+        vec![Job {
+            url: format!("https://bmclapi2.bangbang93.com/optifine/{mc}/{ty}/{patch}"),
+            path: inst.clone(),
+            sha1: None,
+            size: None,
+        }],
+        p,
+    )?;
+    p.check()?;
+
+    let libs = mc_dir().join("libraries");
+    let out_jar = libs.join("optifine").join("OptiFine").join(&ver).join(format!("OptiFine-{ver}.jar"));
+    fs::create_dir_all(out_jar.parent().unwrap())?;
+    let vanilla_jar = versions_dir(mc).join(format!("{mc}.jar"));
+
+    p.say("Установка OptiFine...");
+    p.set(0, 1);
+    let mut cmd = Command::new(java_cli);
+    cmd.arg("-cp")
+        .arg(&inst)
+        .arg("optifine.Patcher")
+        .arg(&vanilla_jar)
+        .arg(&inst)
+        .arg(&out_jar)
+        .current_dir(mc_dir())
+        .stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(sys::NO_WINDOW);
+    }
+    let out = cmd.output().map_err(|e| anyhow!("Не удалось запустить установщик OptiFine: {}", e))?;
+    if !out.status.success() || !out_jar.exists() {
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let mut text = String::from_utf8_lossy(&out.stderr).to_string();
+        if text.trim().is_empty() {
+            text = String::from_utf8_lossy(&out.stdout).to_string();
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let tail = lines[lines.len().saturating_sub(6)..].join("\n");
+        bail!("Установщик OptiFine завершился с ошибкой:\n{}", tail);
+    }
+
+    // launchwrapper-of лежит внутри jar OptiFine (новые версии); у старых берём обычный launchwrapper 1.12
+    let mut lw_ver: Option<String> = None;
+    {
+        let f = fs::File::open(&inst)?;
+        let mut z = zip::ZipArchive::new(f)?;
+        for i in 0..z.len() {
+            let mut e = z.by_index(i)?;
+            let name = e.name().to_string();
+            if let Some(v) = name.strip_prefix("launchwrapper-of-").and_then(|r| r.strip_suffix(".jar")) {
+                let dir = libs.join("optifine").join("launchwrapper-of").join(v);
+                fs::create_dir_all(&dir)?;
+                let mut o = fs::File::create(dir.join(format!("launchwrapper-of-{v}.jar")))?;
+                std::io::copy(&mut e, &mut o)?;
+                lw_ver = Some(v.to_string());
+                break;
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&tmp_dir);
+
+    let lw_lib = match &lw_ver {
+        Some(v) => json!({"name": format!("optifine:launchwrapper-of:{v}")}),
+        None => json!({"name": "net.minecraft:launchwrapper:1.12"}),
+    };
+    let vanilla = load_merged(mc)?;
+    let mut j = json!({
+        "id": id,
+        "inheritsFrom": mc,
+        "type": "release",
+        "mainClass": "net.minecraft.launchwrapper.Launch",
+        "libraries": [ {"name": format!("optifine:OptiFine:{ver}")}, lw_lib ],
+    });
+    if let Some(ma) = vanilla["minecraftArguments"].as_str() {
+        j["minecraftArguments"] = json!(format!("{ma} --tweakClass optifine.OptiFineTweaker"));
+    } else {
+        j["arguments"] = json!({"game": ["--tweakClass", "optifine.OptiFineTweaker"]});
+    }
+    fs::create_dir_all(versions_dir(&id))?;
+    fs::write(version_json_path(&id), serde_json::to_string_pretty(&j)?)?;
+    Ok(())
+}
+
 /// Ставит версию, Java и загрузчик. Возвращает (id версии для запуска, javaw).
 pub fn prepare(mc: &str, loader: &str, p: &Progress) -> Result<(String, PathBuf)> {
     let flag = flag_path(mc, loader);
@@ -894,6 +1091,18 @@ pub fn prepare(mc: &str, loader: &str, p: &Progress) -> Result<(String, PathBuf)
                 install_forge(mc, &java_cli, p)?;
             }
             find_loader_id(mc, "Forge").ok_or_else(|| anyhow!("Не удалось установить Forge"))?
+        }
+        "NeoForge" => {
+            if find_loader_id(mc, "NeoForge").is_none() {
+                install_neoforge(mc, &java_cli, p)?;
+            }
+            find_loader_id(mc, "NeoForge").ok_or_else(|| anyhow!("Не удалось установить NeoForge"))?
+        }
+        "OptiFine" => {
+            if find_loader_id(mc, "OptiFine").is_none() {
+                install_optifine(mc, &java_cli, p)?;
+            }
+            find_loader_id(mc, "OptiFine").ok_or_else(|| anyhow!("Не удалось установить OptiFine"))?
         }
         _ => mc.to_string(),
     };

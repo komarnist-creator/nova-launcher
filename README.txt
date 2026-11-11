@@ -11,7 +11,7 @@ nova - Minecraft launcher (Rust)
 
 nova - лаунчер Minecraft на Rust
 =================================
-Всё, что было в Python-версии: Vanilla / Fabric / Forge / Quilt, офлайн и Ely.by (скины),
+Всё, что было в Python-версии: Vanilla / Fabric / Forge / NeoForge / Quilt / OptiFine, офлайн и Ely.by (скины),
 выбор версии, ОЗУ игре, настройки, очистка логов, ярлык на рабочем столе, F11 - полный экран.
 Конфиг: %APPDATA%\.minecraft\nova.json (настройки из старого nova.json подхватятся сами).
 

@@ -759,7 +759,7 @@ impl App {
                         .width(92.0)
                         .selected_text(self.loader.clone())
                         .show_ui(ui, |ui| {
-                            for l in ["Vanilla", "Fabric", "Forge", "Quilt"] {
+                            for l in ["Vanilla", "Fabric", "Forge", "NeoForge", "Quilt", "OptiFine"] {
                                 ui.selectable_value(&mut self.loader, l.to_string(), l);
                             }
                         });

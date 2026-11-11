@@ -347,7 +347,7 @@ impl App {
         }
 
         let mut versions = vec!["1.16.5".to_string()];
-        if !versions.contains(&cfg.ver) {
+        if !cfg.ver.is_empty() && !versions.contains(&cfg.ver) {
             versions.push(cfg.ver.clone());
         }
         App {
@@ -481,7 +481,7 @@ impl App {
         self.was_busy = busy;
         let key = (self.ver.clone(), self.loader.clone());
         if !busy && (self.recheck || key != self.checked_key) {
-            self.installed = engine::is_installed(&key.0, &key.1);
+            self.installed = !key.0.is_empty() && !key.1.is_empty() && engine::is_installed(&key.0, &key.1);
             self.checked_key = key;
             self.recheck = false;
         }
@@ -546,6 +546,10 @@ impl App {
             self.prog.cancel.store(true, Ordering::SeqCst);
             self.cancelling = true;
             self.prog.say("Отмена установки...");
+            return;
+        }
+        if self.ver.is_empty() || self.loader.is_empty() {
+            self.info("Выбор", "Сначала выбери версию игры и загрузчик.");
             return;
         }
         if self.installed {
@@ -744,10 +748,14 @@ impl App {
             }
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label(muted("Версия"));
+                let ver_empty = self.ver.is_empty();
+                let loader_empty = self.loader.is_empty();
+                if !ver_empty {
+                    ui.label(muted("Версия"));
+                }
                 egui::ComboBox::from_id_source("ver")
-                    .width(92.0)
-                    .selected_text(self.ver.clone())
+                    .width(if ver_empty { 118.0 } else { 92.0 })
+                    .selected_text(if ver_empty { "Выбрать версию".to_string() } else { self.ver.clone() })
                     .show_ui(ui, |ui| {
                         for v in &self.versions {
                             ui.selectable_value(&mut self.ver, v.clone(), v.as_str());
@@ -756,14 +764,16 @@ impl App {
                 // загрузчик прижат к правому краю, как кнопка "Выйти" и ряд кнопок ниже
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     egui::ComboBox::from_id_source("loader")
-                        .width(92.0)
-                        .selected_text(self.loader.clone())
+                        .width(if loader_empty { 138.0 } else { 92.0 })
+                        .selected_text(if loader_empty { "Выбрать загрузчик".to_string() } else { self.loader.clone() })
                         .show_ui(ui, |ui| {
                             for l in ["Vanilla", "Fabric", "Forge", "NeoForge", "Quilt", "OptiFine"] {
                                 ui.selectable_value(&mut self.loader, l.to_string(), l);
                             }
                         });
-                    ui.label(muted("Загрузчик"));
+                    if !loader_empty {
+                        ui.label(muted("Загрузчик"));
+                    }
                 });
             });
             ui.add_space(2.0);
@@ -830,12 +840,18 @@ impl App {
             if self.cancelling { ("ОТМЕНА...", false) } else { ("ОТМЕНА", true) }
         } else if running {
             ("ЗАПУСК...", false)
+        } else if self.ver.is_empty() || self.loader.is_empty() {
+            ("ВЫБЕРИ ВЕРСИЮ", true)
         } else if self.installed {
             ("ИГРАТЬ", true)
         } else {
             ("УСТАНОВИТЬ", true)
         };
-        let sub = format!("Minecraft {}  ·  {}", self.ver, self.loader);
+        let sub = if self.ver.is_empty() || self.loader.is_empty() {
+            "Выбери версию и загрузчик".to_string()
+        } else {
+            format!("Minecraft {}  ·  {}", self.ver, self.loader)
+        };
         let status = self.prog.status();
         let frac = self.prog.frac();
         let bold = self.bold.clone();

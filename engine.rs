@@ -47,8 +47,8 @@ impl Default for Config {
         Config {
             mode: "offline".into(),
             nick: "Player".into(),
-            ver: "1.16.5".into(),
-            loader: "Fabric".into(),
+            ver: String::new(),
+            loader: String::new(),
             ram: None,
             close_after: true,
             jvm_extra: String::new(),
